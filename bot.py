@@ -1,137 +1,146 @@
-import os, time, threading, sqlite3
-from flask import Flask, jsonify, request
-import requests
+import os
+import base64
+import io
+import asyncio
+from flask import Flask, jsonify
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from openai import OpenAI
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-QUOTE_KEY = os.getenv("QUOTE_INGEST_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 PORT = int(os.getenv("PORT", "10000"))
-DB_PATH = os.getenv("DB_PATH", "quotes.db")
 
 app = Flask(__name__)
-TG = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
-
-def db():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
-
-def init_db():
-    c = db()
-    c.execute("""CREATE TABLE IF NOT EXISTS quotes(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        asset TEXT NOT NULL,
-        price REAL NOT NULL
-    )""")
-    c.commit()
-    c.close()
-
-def tg(method, data=None, timeout=20):
-    if not TOKEN:
-        return {"ok": False, "description": "TELEGRAM_BOT_TOKEN not configured"}
-    try:
-        return requests.post(f"{TG}/{method}", json=data or {}, timeout=timeout).json()
-    except Exception as e:
-        return {"ok": False, "description": str(e)}
-
-def send(chat_id, text):
-    return tg("sendMessage", {"chat_id": chat_id, "text": text})
 
 @app.get("/")
 def home():
-    return "Trading Telegram Bot + Binarium Bridge is running."
+    return "Screenshot Trading Analyzer is running."
 
 @app.get("/healthz")
 def healthz():
-    return jsonify(ok=True, quote_key_configured=bool(QUOTE_KEY))
+    return jsonify(
+        ok=True,
+        telegram_configured=bool(TOKEN),
+        openai_configured=bool(OPENAI_API_KEY),
+    )
 
-@app.get("/api/status")
-def status():
-    c = db()
-    r = c.execute("SELECT ts, asset, price FROM quotes ORDER BY id DESC LIMIT 1").fetchone()
-    count = c.execute("SELECT COUNT(*) AS n FROM quotes").fetchone()["n"]
-    c.close()
-    return jsonify(online=True, quotes=count, last_quote=dict(r) if r else None)
+def analyze_image(image_bytes: bytes) -> str:
+    if not OPENAI_API_KEY:
+        return "❌ Не настроен OPENAI_API_KEY в Render."
 
-@app.post("/api/quote")
-def quote():
-    if not QUOTE_KEY or request.headers.get("X-API-Key") != QUOTE_KEY:
-        return jsonify(error="unauthorized"), 401
-    data = request.get_json(silent=True) or {}
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    prompt = """Ты анализируешь скриншот торгового графика только по информации, которая реально видна на изображении.
+
+Ответь строго на русском и в таком формате:
+
+📊 АНАЛИЗ ГРАФИКА
+• Актив: ...
+• Таймфрейм: ... (если виден; иначе «не виден»)
+• Текущая цена: ... (если видна)
+• Тренд: ВВЕРХ / ВНИЗ / БОКОВИК / НЕОПРЕДЕЛЁН
+• Структура: ...
+• Уровни поддержки/сопротивления: ...
+• Свечная картина: ...
+• Индикаторы: ... (только если реально видны)
+• Ближайший сценарий: ...
+
+🎯 МОДЕЛЬНЫЙ СИГНАЛ
+Направление: ВВЕРХ / ВНИЗ / НЕ ОПРЕДЕЛЕНО
+Экспирация: 1 мин / 2 мин / НЕ ОПРЕДЕЛЕНА
+Модельная уверенность: X/100
+
+⚠️ Риски: ...
+
+Правила:
+1. Не выдумывай значения индикаторов, цены, таймфрейм или уровни, которых не видно.
+2. Если скриншот плохого качества или данных недостаточно, прямо напиши «НЕДОСТАТОЧНО ДАННЫХ».
+3. «Модельная уверенность» — это оценка качества сигнала по изображению, а НЕ статистически подтверждённая вероятность выигрыша.
+4. Не обещай прибыль и не утверждай, что сделка гарантированно выигрышная.
+5. Для бинарных опционов отдельно отметь высокий риск.
+6. Не отправляй заявку и не выполняй торговые действия.
+"""
+
+    response = client.responses.create(
+        model=MODEL,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/jpeg;base64,{b64}",
+                },
+            ],
+        }],
+    )
+    return response.output_text
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Бот анализа скриншотов готов.\n\n"
+        "Просто отправь мне скриншот графика Binarium.\n"
+        "Я проанализирую только изображение — без подключения к WebSocket и без получения котировок в реальном времени.\n\n"
+        "/start — запуск\n"
+        "/ping — проверка связи\n"
+        "/status — статус"
+    )
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏓 Pong! Бот работает.")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🟢 Бот онлайн.\n"
+        f"OpenAI API: {'настроен' if OPENAI_API_KEY else 'не настроен'}\n"
+        f"Модель: {MODEL}\n"
+        "Режим: анализ скриншота, без real-time котировок."
+    )
+
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    status_msg = await msg.reply_text("🔎 Анализирую скриншот...")
+
     try:
-        asset = str(data["asset"])
-        price = float(data["price"])
-        ts = str(data.get("ts") or "")
-    except (KeyError, TypeError, ValueError):
-        return jsonify(error="bad quote payload"), 400
+        photo = msg.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        result = await asyncio.to_thread(analyze_image, buf.getvalue())
 
-    c = db()
-    c.execute("INSERT INTO quotes(ts,asset,price) VALUES(?,?,?)",
-              (ts, asset, price))
-    c.commit()
-    c.close()
-    return jsonify(ok=True)
-
-def handle(message):
-    cid = str(message["chat"]["id"])
-    text = (message.get("text") or "").strip()
-    if text.startswith("/start"):
-        send(cid, "🤖 Бот запущен!\n\n/start — запуск\n/help — помощь\n/ping — проверка связи\n/id — Chat ID\n/status — статус\n/quotes — последние котировки")
-    elif text.startswith("/help"):
-        send(cid, "Бот принимает котировки через READ ONLY Bridge. Заявки на сделки он не отправляет.")
-    elif text.startswith("/ping"):
-        send(cid, "🏓 Pong! Связь работает.")
-    elif text.startswith("/id"):
-        send(cid, f"🆔 Ваш Chat ID: {cid}")
-    elif text.startswith("/status"):
-        c = db()
-        r = c.execute("SELECT ts,asset,price FROM quotes ORDER BY id DESC LIMIT 1").fetchone()
-        n = c.execute("SELECT COUNT(*) AS n FROM quotes").fetchone()["n"]
-        c.close()
-        last = f"{r['asset']} {r['price']} ({r['ts']})" if r else "пока нет"
-        send(cid, f"🟢 Бот онлайн.\nКотировок получено: {n}\nПоследняя: {last}")
-    elif text.startswith("/quotes"):
-        c = db()
-        rows = c.execute("SELECT ts,asset,price FROM quotes ORDER BY id DESC LIMIT 5").fetchall()
-        c.close()
-        if not rows:
-            send(cid, "Пока котировок нет.")
+        # Telegram message limit is 4096 chars.
+        if len(result) <= 4000:
+            await status_msg.edit_text(result)
         else:
-            send(cid, "📊 Последние котировки:\n" + "\n".join(
-                f"{r['asset']}: {r['price']} — {r['ts']}" for r in rows
-            ))
+            await status_msg.delete()
+            for i in range(0, len(result), 4000):
+                await msg.reply_text(result[i:i+4000])
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка анализа: {e}")
 
-def poll():
-    offset = None
-    tg("deleteWebhook", {"drop_pending_updates": False})
-    print("Telegram polling started.")
-    while True:
-        try:
-            payload = {"timeout": 25, "allowed_updates": ["message"]}
-            if offset is not None:
-                payload["offset"] = offset
-            res = tg("getUpdates", payload, timeout=35)
-            if not res.get("ok"):
-                print("Telegram error:", res.get("description"))
-                time.sleep(5)
-                continue
-            for u in res.get("result", []):
-                offset = u["update_id"] + 1
-                if "message" in u:
-                    try:
-                        handle(u["message"])
-                    except Exception as e:
-                        print("Handler error:", e)
-        except Exception as e:
-            print("Polling error:", e)
-            time.sleep(5)
+async def text_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Отправь именно фотографию/скриншот графика. "
+        "Я не получаю поток котировок и не подключаюсь к Binarium."
+    )
 
-init_db()
+def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(MessageHandler(filters.PHOTO, photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_help))
+
+    # Run Telegram long polling in the main process.
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    if TOKEN:
-        threading.Thread(target=poll, daemon=True).start()
-    else:
-        print("ERROR: TELEGRAM_BOT_TOKEN is not configured.")
-    app.run(host="0.0.0.0", port=PORT)
+    main()
